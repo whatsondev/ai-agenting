@@ -1,59 +1,256 @@
 <?php
+
 include "config.php";
 include "ai.php";
 include "functions.php";
 
-// VERIFY
-if($_SERVER['REQUEST_METHOD']==='GET'){
-    if($_GET['hub_verify_token']==$VERIFY_TOKEN){
-        echo $_GET['hub_challenge'];
+/*
+|--------------------------------------------------------------------------
+| WEBHOOK VERIFY
+|--------------------------------------------------------------------------
+*/
+
+if ($_SERVER['REQUEST_METHOD'] === 'GET') {
+
+    $verify_token = $_GET['hub_verify_token'] ?? '';
+    $challenge = $_GET['hub_challenge'] ?? '';
+
+    if ($verify_token === $VERIFY_TOKEN) {
+        echo $challenge;
+    } else {
+        http_response_code(403);
+        echo "Invalid Verify Token";
     }
+
     exit;
 }
 
-// RECEIVE DATA
-$data = json_decode(file_get_contents("php://input"),true);
+/*
+|--------------------------------------------------------------------------
+| RECEIVE WEBHOOK DATA
+|--------------------------------------------------------------------------
+*/
 
-foreach($data['entry'] as $entry){
-    foreach($entry['changes'] as $change){
+$raw = file_get_contents("php://input");
 
-        $val = $change['value'];
+file_put_contents(
+    __DIR__ . "/logs/webhook_log.txt",
+    date("Y-m-d H:i:s") . PHP_EOL .
+    $raw . PHP_EOL . PHP_EOL,
+    FILE_APPEND
+);
 
-        $comment = $val['text'] ?? $val['comment_text'] ?? '';
-        $comment_id = $val['id'] ?? $val['comment_id'] ?? '';
-        $user = $val['from']['name'] ?? '';
+$data = json_decode($raw, true);
 
-        if(!$comment) continue;
+if (!$data || !isset($data['entry'])) {
+    http_response_code(200);
+    exit;
+}
 
-        // Ignore own comments
-        if(isset($val['from']['id']) && $val['from']['id']=="$PAGE_ID"){
+/*
+|--------------------------------------------------------------------------
+| PROCESS EVENTS
+|--------------------------------------------------------------------------
+*/
+
+foreach ($data['entry'] as $entry) {
+
+    if (!isset($entry['changes'])) {
+        continue;
+    }
+
+    foreach ($entry['changes'] as $change) {
+
+        /*
+        |--------------------------------------------------------------------------
+        | ONLY HANDLE COMMENT EVENTS
+        |--------------------------------------------------------------------------
+        */
+
+        if (($change['field'] ?? '') !== 'feed') {
             continue;
         }
 
-        // SPAM FILTER
-        if(preg_match('/http|crypto|bitcoin/i',$comment)){
+        $val = $change['value'] ?? [];
+
+        /*
+        |--------------------------------------------------------------------------
+        | ONLY NEW COMMENTS
+        |--------------------------------------------------------------------------
+        */
+
+        if (($val['verb'] ?? '') !== 'add') {
             continue;
         }
 
-        // SAVE
-        $stmt = $conn->prepare("INSERT INTO comments(platform,comment_id,user_name,comment) VALUES('fb_ig',?,?,?)");
-        $stmt->bind_param("sss",$comment_id,$user,$comment);
+        /*
+        |--------------------------------------------------------------------------
+        | GET COMMENT DATA
+        |--------------------------------------------------------------------------
+        */
+
+        $comment_id = $val['comment_id'] ?? '';
+        $comment = trim($val['message'] ?? '');
+        $post_id = $val['post_id'] ?? '';
+
+        $user_name = $val['from']['name'] ?? 'Unknown';
+        $user_id = $val['from']['id'] ?? '';
+
+        /*
+        |--------------------------------------------------------------------------
+        | VALIDATION
+        |--------------------------------------------------------------------------
+        */
+
+        if (empty($comment_id) || empty($comment)) {
+            continue;
+        }
+
+        /*
+        |--------------------------------------------------------------------------
+        | IGNORE OWN COMMENTS
+        |--------------------------------------------------------------------------
+        */
+
+        if ($user_id == $PAGE_ID) {
+            continue;
+        }
+
+        /*
+        |--------------------------------------------------------------------------
+        | BASIC SPAM FILTER
+        |--------------------------------------------------------------------------
+        */
+
+        if (preg_match('/http|crypto|bitcoin|forex|investment/i', $comment)) {
+
+            file_put_contents(
+                __DIR__ . "/logs/spam_log.txt",
+                "[" . date("Y-m-d H:i:s") . "] " . $comment . PHP_EOL,
+                FILE_APPEND
+            );
+
+            continue;
+        }
+
+        /*
+        |--------------------------------------------------------------------------
+        | AVOID DUPLICATE REPLY
+        |--------------------------------------------------------------------------
+        */
+
+        $check = $conn->prepare("SELECT id FROM comments WHERE comment_id=? LIMIT 1");
+        $check->bind_param("s", $comment_id);
+        $check->execute();
+        $result = $check->get_result();
+
+        if ($result->num_rows > 0) {
+            continue;
+        }
+
+        /*
+        |--------------------------------------------------------------------------
+        | SAVE COMMENT
+        |--------------------------------------------------------------------------
+        */
+
+        $platform = "facebook";
+
+        $stmt = $conn->prepare("
+            INSERT INTO comments 
+            (platform, comment_id, user_name, comment, status, created_at)
+            VALUES (?, ?, ?, ?, 'pending', NOW())
+        ");
+
+        $stmt->bind_param(
+            "ssss",
+            $platform,
+            $comment_id,
+            $user_name,
+            $comment
+        );
+
         $stmt->execute();
 
-        // DELAY (avoid ban)
-        sleep(rand(5,15));
+        /*
+        |--------------------------------------------------------------------------
+        | GENERATE AI REPLY
+        |--------------------------------------------------------------------------
+        */
 
-        // AI
         $reply = generateReply($comment);
 
-        if($reply){
-            sendReply($comment_id,$reply);
+        if (!$reply) {
 
-            $stmt = $conn->prepare("UPDATE comments SET reply=?,status='replied' WHERE comment_id=?");
-            $stmt->bind_param("ss",$reply,$comment_id);
-            $stmt->execute();
+            file_put_contents(
+                __DIR__ . "/logs/ai_error_log.txt",
+                "[" . date("Y-m-d H:i:s") . "] Failed AI reply for: " . $comment . PHP_EOL,
+                FILE_APPEND
+            );
+
+            continue;
         }
+
+        /*
+        |--------------------------------------------------------------------------
+        | SEND REPLY
+        |--------------------------------------------------------------------------
+        */
+
+        $response = sendReply($comment_id, $reply);
+
+        /*
+        |--------------------------------------------------------------------------
+        | SAVE RESPONSE STATUS
+        |--------------------------------------------------------------------------
+        */
+
+        $status = "failed";
+
+        if (!empty($response['id'])) {
+            $status = "replied";
+        }
+
+        $update = $conn->prepare("
+            UPDATE comments 
+            SET reply=?, status=?, replied_at=NOW()
+            WHERE comment_id=?
+        ");
+
+        $update->bind_param(
+            "sss",
+            $reply,
+            $status,
+            $comment_id
+        );
+
+        $update->execute();
+
+        /*
+        |--------------------------------------------------------------------------
+        | SAVE API RESPONSE LOG
+        |--------------------------------------------------------------------------
+        */
+
+        file_put_contents(
+            __DIR__ . "/logs/reply_log.txt",
+            "[" . date("Y-m-d H:i:s") . "]" . PHP_EOL .
+            "Comment ID: " . $comment_id . PHP_EOL .
+            "User: " . $user_name . PHP_EOL .
+            "Comment: " . $comment . PHP_EOL .
+            "Reply: " . $reply . PHP_EOL .
+            "Response: " . json_encode($response) . PHP_EOL .
+            "-----------------------------------" . PHP_EOL,
+            FILE_APPEND
+        );
     }
 }
 
+/*
+|--------------------------------------------------------------------------
+| RESPONSE TO META
+|--------------------------------------------------------------------------
+*/
+
 http_response_code(200);
+echo "EVENT_RECEIVED";
